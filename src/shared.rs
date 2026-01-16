@@ -28,6 +28,7 @@ pub enum ClientMessage {
 
     /// Initial client message specifying a port to forward.
     Hello(u16),
+    IAmAt(String),
 
     /// Accepts an incoming TCP connection, using this stream as a proxy.
     Accept(Uuid),

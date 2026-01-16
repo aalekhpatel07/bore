@@ -25,6 +25,8 @@ pub struct Server {
     /// Concurrent map of IDs to incoming connections.
     conns: Arc<DashMap<Uuid, TcpStream>>,
 
+    subdomains: Arc<DashMap<Uuid, String>>,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -115,6 +117,16 @@ impl Server {
         }
     }
 
+    async fn create_listener_arbitrary_port(&self) -> Result<TcpListener, &'static str> {
+        TcpListener::bind((self.bind_tunnels, 0))
+        .await
+        .map_err(|err| match err.kind() {
+            io::ErrorKind::AddrInUse => "port already in use",
+            io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "failed to bind to port",
+        })
+    }
+
     async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
         let mut stream = Delimited::new(stream);
         if let Some(auth) = &self.auth {
@@ -130,6 +142,45 @@ impl Server {
                 warn!("unexpected authenticate");
                 Ok(())
             }
+            Some(ClientMessage::IAmAt(subdomain)) => {
+                let listener = match self.create_listener_arbitrary_port().await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        stream.send(ServerMessage::Error(err.into())).await?;
+                        return Ok(());
+                    }
+                };
+
+                let host = listener.local_addr()?.ip();
+                let port = listener.local_addr()?.port();
+                info!(?host, ?port, "new client");
+                stream.send(ServerMessage::Hello(port)).await?;
+
+                loop {
+                    if stream.send(ServerMessage::Heartbeat).await.is_err() {
+                        // Assume that the TCP connection has been dropped.
+                        return Ok(());
+                    }
+                    const TIMEOUT: Duration = Duration::from_millis(500);
+                    if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
+                        let (stream2, addr) = result?;
+                        info!(?addr, ?port, "new connection");
+
+                        let id = Uuid::new_v4();
+                        let conns = Arc::clone(&self.conns);
+
+                        conns.insert(id, stream2);
+                        tokio::spawn(async move {
+                            // Remove stale entries to avoid memory leaks.
+                            sleep(Duration::from_secs(10)).await;
+                            if conns.remove(&id).is_some() {
+                                warn!(%id, "removed stale connection");
+                            }
+                        });
+                        stream.send(ServerMessage::Connection(id)).await?;
+                    }
+                }
+            },
             Some(ClientMessage::Hello(port)) => {
                 let listener = match self.create_listener(port).await {
                     Ok(listener) => listener,
